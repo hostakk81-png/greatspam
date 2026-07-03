@@ -442,6 +442,149 @@ async def send_admin_log(bot: Bot, text: str) -> None:
         logger.exception("Failed to send admin log to chat_id=%s", chat_id)
 
 
+def record_app_event(
+    event_type: str,
+    user_id: int | None = None,
+    amount: float = 0.0,
+    method: str = "",
+    meta: dict | None = None,
+) -> None:
+    try:
+        meta_json = json.dumps(meta or {}, ensure_ascii=False)
+    except (TypeError, ValueError):
+        meta_json = "{}"
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_events(event_type, user_id, amount, method, meta_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_type,
+                int(user_id) if user_id is not None else None,
+                float(amount or 0),
+                method or "",
+                meta_json,
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+
+
+async def ensure_user_and_log(bot: Bot, user: User | None) -> bool:
+    if not user or is_admin(user.id):
+        return False
+    is_new = ensure_user(user.id)
+    if not is_new:
+        return False
+    record_app_event("new_user", user.id, meta={"username": user.username or ""})
+    await send_admin_log(
+        bot,
+        "<b><tg-emoji emoji-id='5260399854500191689'>👤</tg-emoji> Новый пользователь</b>\n"
+        f"<blockquote><b>{user_log_label(user)}</b></blockquote>",
+    )
+    return True
+
+
+def _scalar(conn: sqlite3.Connection, query: str, params: tuple = ()) -> float:
+    row = conn.execute(query, params).fetchone()
+    return row[0] if row and row[0] is not None else 0
+
+
+def get_admin_stats() -> dict:
+    now = int(time.time())
+    day_ago = now - 86400
+    with sqlite3.connect(DB_PATH) as conn:
+        total_users = int(_scalar(conn, "SELECT COUNT(*) FROM users"))
+        banned_users = int(_scalar(conn, "SELECT COUNT(*) FROM users WHERE is_banned = 1"))
+        active_users = int(
+            _scalar(
+                conn,
+                """
+                SELECT COUNT(*) FROM users
+                WHERE subscription_months > 0
+                   OR subscription_weeks > 0
+                   OR lifetime_access = 1
+                   OR message_credits > 0
+                """,
+            )
+        )
+        accounts_count = int(_scalar(conn, "SELECT COUNT(*) FROM accounts"))
+        total_balance = float(_scalar(conn, "SELECT COALESCE(SUM(balance), 0) FROM users"))
+        paid_total = float(
+            _scalar(
+                conn,
+                "SELECT COALESCE(SUM(amount), 0) FROM app_events WHERE event_type = 'payment_paid'",
+            )
+        )
+        paid_count = int(
+            _scalar(conn, "SELECT COUNT(*) FROM app_events WHERE event_type = 'payment_paid'")
+        )
+        tariff_total = float(
+            _scalar(
+                conn,
+                "SELECT COALESCE(SUM(amount), 0) FROM app_events WHERE event_type = 'tariff_purchase'",
+            )
+        )
+        tariff_count = int(
+            _scalar(conn, "SELECT COUNT(*) FROM app_events WHERE event_type = 'tariff_purchase'")
+        )
+        promo_total = float(
+            _scalar(
+                conn,
+                "SELECT COALESCE(SUM(amount), 0) FROM app_events WHERE event_type = 'promo_used'",
+            )
+        )
+        promo_count = int(_scalar(conn, "SELECT COUNT(*) FROM app_events WHERE event_type = 'promo_used'"))
+        invoices_created = int(
+            _scalar(conn, "SELECT COUNT(*) FROM app_events WHERE event_type = 'invoice_created'")
+        )
+        users_24h = int(
+            _scalar(
+                conn,
+                "SELECT COUNT(*) FROM app_events WHERE event_type = 'new_user' AND created_at >= ?",
+                (day_ago,),
+            )
+        )
+        xrocket_total = float(
+            _scalar(
+                conn,
+                "SELECT COALESCE(SUM(amount), 0) FROM app_events WHERE event_type = 'payment_paid' AND method = 'XRocket'",
+            )
+        )
+        cryptobot_total = float(
+            _scalar(
+                conn,
+                "SELECT COALESCE(SUM(amount), 0) FROM app_events WHERE event_type = 'payment_paid' AND method = 'CryptoBot'",
+            )
+        )
+        ton_total = float(
+            _scalar(
+                conn,
+                "SELECT COALESCE(SUM(amount), 0) FROM app_events WHERE event_type = 'payment_paid' AND method = 'Tonkeeper'",
+            )
+        )
+    return {
+        "total_users": total_users,
+        "banned_users": banned_users,
+        "active_users": active_users,
+        "inactive_users": max(0, total_users - active_users),
+        "accounts_count": accounts_count,
+        "total_balance": total_balance,
+        "paid_total": paid_total,
+        "paid_count": paid_count,
+        "tariff_total": tariff_total,
+        "tariff_count": tariff_count,
+        "promo_total": promo_total,
+        "promo_count": promo_count,
+        "invoices_created": invoices_created,
+        "users_24h": users_24h,
+        "xrocket_total": xrocket_total,
+        "cryptobot_total": cryptobot_total,
+        "ton_total": ton_total,
+    }
+
+
 def get_known_user_ids() -> list[int]:
     user_ids: set[int] = set()
     with sqlite3.connect(DB_PATH) as conn:
@@ -643,6 +786,25 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS app_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                user_id INTEGER,
+                amount REAL NOT NULL DEFAULT 0,
+                method TEXT NOT NULL DEFAULT '',
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_app_events_type_time ON app_events(event_type, created_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_app_events_method ON app_events(method)"
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -831,6 +993,7 @@ class MandatorySubMiddleware(BaseMiddleware):
             user = event.from_user
         if user is None:
             return await handler(event, data)
+        await ensure_user_and_log(bot, user)
         if is_admin(user.id):
             return await handler(event, data)
         if is_banned(user.id):
@@ -1184,6 +1347,14 @@ def admin_inline():
             ],
             [
                 InlineKeyboardButton(
+                    text="Статистика",
+                    callback_data="adm_stats",
+                    style="primary",
+                    icon_custom_emoji_id=STATISTICS_EMOJI_ID,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="Добавить оп",
                     callback_data="admin_reqadd",
                     style="primary",
@@ -1236,6 +1407,57 @@ def admin_logs_inline() -> InlineKeyboardMarkup:
                     callback_data="adm_logs_delete",
                     style="danger",
                     icon_custom_emoji_id=TRASH_EMOJI_ID,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Назад в админку",
+                    callback_data="admin_req_back",
+                    icon_custom_emoji_id=BACK_EMOJI_ID,
+                ),
+            ],
+        ]
+    )
+
+
+def admin_stats_caption() -> str:
+    s = get_admin_stats()
+    return (
+        f"<b><tg-emoji emoji-id='{STATISTICS_EMOJI_ID}'>📊</tg-emoji> Статистика</b>\n\n"
+        "<blockquote>"
+        f"<b>Пользователей всего: <code>{s['total_users']}</code></b>\n"
+        f"<b>Новых за 24ч: <code>{s['users_24h']}</code></b>\n"
+        f"<b>С подпиской/кредитами: <code>{s['active_users']}</code></b>\n"
+        f"<b>Без подписки: <code>{s['inactive_users']}</code></b>\n"
+        f"<b>Забанено: <code>{s['banned_users']}</code></b>\n"
+        f"<b>Сессий аккаунтов: <code>{s['accounts_count']}</code></b>\n"
+        f"<b>Баланс у пользователей: <code>{s['total_balance']:.2f}</code> {BALANCE_CURRENCY}</b>"
+        "</blockquote>\n\n"
+        "<blockquote>"
+        f"<b>Оборот оплат: <code>{s['paid_total']:.2f}</code> {BALANCE_CURRENCY}</b>\n"
+        f"<b>Оплаченных счетов: <code>{s['paid_count']}</code></b>\n"
+        f"<b>Создано счетов: <code>{s['invoices_created']}</code></b>\n"
+        f"<b>XRocket: <code>{s['xrocket_total']:.2f}</code> {BALANCE_CURRENCY}</b>\n"
+        f"<b>CryptoBot: <code>{s['cryptobot_total']:.2f}</code> {BALANCE_CURRENCY}</b>\n"
+        "</blockquote>\n\n"
+        "<blockquote>"
+        f"<b>Покупок тарифов: <code>{s['tariff_count']}</code></b>\n"
+        f"<b>Списано на тарифы: <code>{s['tariff_total']:.2f}</code> {BALANCE_CURRENCY}</b>\n"
+        f"<b>Промокодов активировано: <code>{s['promo_count']}</code></b>\n"
+        f"<b>Начислено промокодами: <code>{s['promo_total']:.2f}</code> {BALANCE_CURRENCY}</b>"
+        "</blockquote>"
+    )
+
+
+def admin_stats_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Обновить",
+                    callback_data="adm_stats_refresh",
+                    style="primary",
+                    icon_custom_emoji_id=REPEAT_EMOJI_ID,
                 ),
             ],
             [
@@ -3164,6 +3386,18 @@ async def admin_logs_delete_handler(callback: CallbackQuery):
     await safe_edit_text(callback.message, text=admin_logs_caption(), reply_markup=admin_logs_inline())
 
 
+@dp.callback_query(F.data.in_({"adm_stats", "adm_stats_refresh"}))
+async def admin_stats_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+    if callback.data == "adm_stats_refresh":
+        await callback.answer("Обновлено")
+    else:
+        await callback.answer()
+    await safe_edit_text(callback.message, text=admin_stats_caption(), reply_markup=admin_stats_inline())
+
+
 @dp.callback_query(F.data == "admin_reqadd")
 async def admin_reqadd_handler(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -3848,6 +4082,7 @@ async def promo_handler(message: Message):
         await message.answer("Промокод недействителен")
         return
     add_balance(message.from_user.id, amount)
+    record_app_event("promo_used", message.from_user.id, amount, "Promo", {"code": code})
     await send_admin_log(
         message.bot,
         "<b><tg-emoji emoji-id='5874948844935974490'>⭐️</tg-emoji> Промокод активирован</b>\n"
@@ -3863,13 +4098,7 @@ async def promo_handler(message: Message):
 # 🚀 СТАРТ
 @dp.message(F.text == "/start")
 async def start_handler(message: Message):
-    is_new_user = ensure_user(message.from_user.id)
-    if is_new_user:
-        await send_admin_log(
-            message.bot,
-            "<b><tg-emoji emoji-id='5260399854500191689'>👤</tg-emoji> Новый пользователь</b>\n"
-            f"<blockquote><b>{user_log_label(message.from_user)}</b></blockquote>",
-        )
+    await ensure_user_and_log(message.bot, message.from_user)
     if is_banned(message.from_user.id):
         await message.answer("<b><tg-emoji emoji-id='5278578973595427038'>🚫</tg-emoji> Вы заблокированы администратором</b>")
         return
@@ -4693,6 +4922,7 @@ async def rub_amount_input_handler(message: Message):
             await message.answer("Промокод недействителен")
             return
         add_balance(message.from_user.id, amount)
+        record_app_event("promo_used", message.from_user.id, amount, "Promo", {"code": code})
         await send_admin_log(
             message.bot,
             "<b><tg-emoji emoji-id='5874948844935974490'>⭐️</tg-emoji> Промокод активирован</b>\n"
@@ -4734,6 +4964,13 @@ async def rub_amount_input_handler(message: Message):
                 amount = float(parts[1])
                 uses = int(parts[2])
                 create_or_update_promo(code, amount, uses)
+                record_app_event(
+                    "promo_created",
+                    message.from_user.id,
+                    amount,
+                    "Admin",
+                    {"code": code, "uses": uses},
+                )
                 await send_admin_log(
                     message.bot,
                     "<b><tg-emoji emoji-id='5874948844935974490'>⭐️</tg-emoji> Промокод создан</b>\n"
@@ -4752,6 +4989,13 @@ async def rub_amount_input_handler(message: Message):
                 target_id = int(parts[0])
                 amount = float(parts[1])
                 add_balance(target_id, amount)
+                record_app_event(
+                    "admin_balance",
+                    target_id,
+                    amount,
+                    "Admin",
+                    {"admin_id": message.from_user.id},
+                )
                 await send_admin_log(
                     message.bot,
                     "<b><tg-emoji emoji-id='5255933397750014894'>💱</tg-emoji> Баланс выдан админом</b>\n"
@@ -4769,6 +5013,13 @@ async def rub_amount_input_handler(message: Message):
                 target_id = int(parts[0])
                 months = int(parts[1])
                 add_subscription_months(target_id, months)
+                record_app_event(
+                    "admin_subscription",
+                    target_id,
+                    0,
+                    "Admin",
+                    {"admin_id": message.from_user.id, "months": months},
+                )
                 await send_admin_log(
                     message.bot,
                     "<b><tg-emoji emoji-id='5345892681765645532'>💎</tg-emoji> Подписка выдана админом</b>\n"
@@ -4824,6 +5075,13 @@ async def rub_amount_input_handler(message: Message):
         }
         awaiting_xrocket_amount.pop(message.from_user.id, None)
         asyncio.create_task(auto_check_xrocket_payment(message.from_user.id))
+        record_app_event(
+            "invoice_created",
+            message.from_user.id,
+            rub_amount,
+            "XRocket",
+            {"invoice_id": invoice["id"]},
+        )
         await send_admin_log(
             message.bot,
             "<b><tg-emoji emoji-id='5415897719522744378'>🚀</tg-emoji> Создан счет</b>\n"
@@ -4885,6 +5143,13 @@ async def rub_amount_input_handler(message: Message):
         }
         awaiting_ton_rub_amount.pop(message.from_user.id, None)
         asyncio.create_task(auto_check_ton_payment(message.from_user.id))
+        record_app_event(
+            "invoice_created",
+            message.from_user.id,
+            rub_amount,
+            "Tonkeeper",
+            {"comment": comment, "ton_amount": ton_amount},
+        )
         await send_admin_log(
             message.bot,
             "<b><tg-emoji emoji-id='5361914370068613491'>👛</tg-emoji> Создан счет</b>\n"
@@ -4942,6 +5207,13 @@ async def rub_amount_input_handler(message: Message):
     }
     awaiting_rub_amount.pop(message.from_user.id, None)
     asyncio.create_task(auto_check_payment(message.from_user.id))
+    record_app_event(
+        "invoice_created",
+        message.from_user.id,
+        rub_amount,
+        "CryptoBot",
+        {"invoice_id": invoice["invoice_id"]},
+    )
     await send_admin_log(
         message.bot,
         "<b><tg-emoji emoji-id='5361914370068613491'>👛</tg-emoji> Создан счет</b>\n"
@@ -4981,6 +5253,13 @@ async def check_xrocket_payment_handler(callback: CallbackQuery):
     if pending.get("paid") or invoice.get("status") == "paid":
         amount_rub = float(pending["rub_amount"])
         add_balance(callback.from_user.id, amount_rub)
+        record_app_event(
+            "payment_paid",
+            callback.from_user.id,
+            amount_rub,
+            "XRocket",
+            {"invoice_id": pending["invoice_id"]},
+        )
         await send_admin_log(
             callback.bot,
             "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Оплата зачислена</b>\n"
@@ -5028,6 +5307,13 @@ async def check_cryptobot_payment_handler(callback: CallbackQuery):
     if invoice.get("status") == "paid" or pending.get("paid"):
         amount_rub = float(pending["rub_amount"])
         add_balance(callback.from_user.id, amount_rub)
+        record_app_event(
+            "payment_paid",
+            callback.from_user.id,
+            amount_rub,
+            "CryptoBot",
+            {"invoice_id": pending["invoice_id"]},
+        )
         await send_admin_log(
             callback.bot,
             "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Оплата зачислена</b>\n"
@@ -5070,6 +5356,13 @@ async def check_tonkeeper_payment_handler(callback: CallbackQuery):
     if paid or pending.get("paid"):
         amount_rub = float(pending["rub_amount"])
         add_balance(callback.from_user.id, amount_rub)
+        record_app_event(
+            "payment_paid",
+            callback.from_user.id,
+            amount_rub,
+            "Tonkeeper",
+            {"comment": pending["comment"]},
+        )
         await send_admin_log(
             callback.bot,
             "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Оплата зачислена</b>\n"
@@ -5890,6 +6183,13 @@ async def sub_purchase_handler(callback: CallbackQuery):
     elif sub_type == "slots5":
         add_account_slots(callback.from_user.id, 5)
 
+    record_app_event(
+        "tariff_purchase",
+        callback.from_user.id,
+        price,
+        "Balance",
+        {"tariff": sub_type, "label": tariff_label},
+    )
     await send_admin_log(
         callback.bot,
         "<b><tg-emoji emoji-id='5345892681765645532'>💎</tg-emoji> Покупка тарифа</b>\n"
