@@ -37,7 +37,6 @@ from telethon.errors import (
     PhoneNumberAppSignupForbiddenError,
     PhoneMigrateError,
 )
-from telethon.errors.rpcerrorlist import FolderIdInvalidError
 try:
     from telethon.tl.functions.messages import GetDialogFiltersRequest
 except ImportError:
@@ -2261,10 +2260,12 @@ async def load_account_dialogs(
     q = (query or "").strip().lower()
     try:
         kwargs: dict[str, Any] = {}
+        wanted_folder_id: int | None = None
         if folder_key == "archive":
             kwargs["archived"] = True
         elif folder_key.startswith("f") and folder_key[1:].isdigit():
-            kwargs["folder"] = int(folder_key[1:])
+            kwargs["archived"] = False
+            wanted_folder_id = int(folder_key[1:])
         else:
             kwargs["archived"] = False
         try:
@@ -2272,6 +2273,12 @@ async def load_account_dialogs(
         except TypeError:
             iterator = client.iter_dialogs(archived=(folder_key == "archive"))
         async for dialog in iterator:
+            if wanted_folder_id is not None:
+                dialog_folder_id = getattr(dialog, "folder_id", None)
+                if dialog_folder_id is None:
+                    dialog_folder_id = getattr(getattr(dialog, "dialog", None), "folder_id", None)
+                if int(dialog_folder_id or 0) != wanted_folder_id:
+                    continue
             name = (getattr(dialog, "name", None) or "").strip() or "Без названия"
             if q and q not in name.lower():
                 continue
@@ -2285,8 +2292,6 @@ async def load_account_dialogs(
             )
             if len(out) >= limit:
                 break
-    except FolderIdInvalidError:
-        logger.warning("load dialogs invalid folder account_id=%s folder=%s", account_id, folder_key)
     except Exception:
         logger.exception("load dialogs failed account_id=%s folder=%s", account_id, folder_key)
     finally:
