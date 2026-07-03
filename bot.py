@@ -5036,7 +5036,7 @@ async def mail_set_media_handler(callback: CallbackQuery):
             "<b><tg-emoji emoji-id='5276442772826515132'>🎨</tg-emoji> Медиа к тексту</b>\n\n"
             "<blockquote><b><tg-emoji emoji-id='5278753302023004775'>ℹ️</tg-emoji> Отправьте фото, GIF или видео (MP4)</b>\n"
             "<b>Подпись к медиа = текст рассылки (цитата, жирный, ссылки и т.д.).</b>\n"
-            "<b>Текст из раздела «Текст» тоже сохранится, если подпись не менять.</b>\n"
+            "<b>Текст из раздела «Текст» тоже сохранится, если подпись не менять.</b></blockquote>"
         ),
         reply_markup=mail_settings_cancel_inline(),
     )
