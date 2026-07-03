@@ -37,6 +37,7 @@ from telethon.errors import (
     PhoneNumberAppSignupForbiddenError,
     PhoneMigrateError,
 )
+from telethon.errors.rpcerrorlist import FolderIdInvalidError
 try:
     from telethon.tl.functions.messages import GetDialogFiltersRequest
 except ImportError:
@@ -2284,6 +2285,8 @@ async def load_account_dialogs(
             )
             if len(out) >= limit:
                 break
+    except FolderIdInvalidError:
+        logger.warning("load dialogs invalid folder account_id=%s folder=%s", account_id, folder_key)
     except Exception:
         logger.exception("load dialogs failed account_id=%s folder=%s", account_id, folder_key)
     finally:
