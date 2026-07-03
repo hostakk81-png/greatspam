@@ -69,6 +69,7 @@ awaiting_ton_rub_amount = {}
 awaiting_promo_input = {}
 admin_action_state = {}
 admin_broadcast_state = {}
+admin_log_state = {}
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.abspath(
     os.getenv(
@@ -366,7 +367,7 @@ def get_message_credits(user_id):
 
 def ensure_user(user_id):
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO users(user_id, balance, subscription_months, subscription_weeks, is_banned, message_credits, account_slots, lifetime_access)
             VALUES (?, 0, 0, 0, 0, 0, ?, 0)
@@ -375,6 +376,70 @@ def ensure_user(user_id):
             (int(user_id), DEFAULT_ACCOUNT_SLOTS),
         )
         conn.commit()
+        return cur.rowcount > 0
+
+
+def get_setting(key: str, default: str = "") -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return str(row[0]) if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO app_settings(key, value)
+            VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
+def delete_setting(key: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM app_settings WHERE key = ?", (key,))
+        conn.commit()
+
+
+def get_log_chat_id() -> int | None:
+    raw = get_setting("log_chat_id", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid log_chat_id setting ignored: %r", raw)
+        return None
+
+
+def user_log_label(user: User | None) -> str:
+    if not user:
+        return "<code>unknown</code>"
+    parts = [f"ID: <code>{int(user.id)}</code>"]
+    if user.username:
+        parts.append(f"@{html.escape(user.username)}")
+    name = " ".join(part for part in (user.first_name, user.last_name) if part)
+    if name:
+        parts.append(html.escape(name))
+    return " | ".join(parts)
+
+
+async def send_admin_log(bot: Bot, text: str) -> None:
+    chat_id = get_log_chat_id()
+    if not chat_id:
+        return
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.exception("Failed to send admin log to chat_id=%s", chat_id)
 
 
 def get_known_user_ids() -> list[int]:
@@ -565,6 +630,14 @@ def init_db():
                 code TEXT PRIMARY KEY,
                 amount REAL NOT NULL,
                 uses INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             )
             """
         )
@@ -1103,6 +1176,14 @@ def admin_inline():
             ],
             [
                 InlineKeyboardButton(
+                    text="Логи",
+                    callback_data="adm_logs",
+                    style="primary",
+                    icon_custom_emoji_id=STATISTICS_EMOJI_ID,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="Добавить оп",
                     callback_data="admin_reqadd",
                     style="primary",
@@ -1117,6 +1198,52 @@ def admin_inline():
             ],
             [
                 InlineKeyboardButton(text="Назад на главную", callback_data="admin_back_main", icon_custom_emoji_id="5278413853577734640"),  # 🏠
+            ],
+        ]
+    )
+
+
+def admin_logs_caption() -> str:
+    chat_id = get_log_chat_id()
+    current = f"<code>{chat_id}</code>" if chat_id is not None else "<code>не указан</code>"
+    return (
+        f"<b><tg-emoji emoji-id='{STATISTICS_EMOJI_ID}'>📊</tg-emoji> Логи</b>\n\n"
+        f"<blockquote><b>Текущий чат логов: {current}</b>\n"
+        "<b>Сюда будут приходить новые пользователи, инвойсы, оплаты, промокоды и покупки тарифов.</b></blockquote>"
+    )
+
+
+def admin_logs_inline() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Использовать этот чат",
+                    callback_data="adm_logs_this",
+                    style="primary",
+                    icon_custom_emoji_id=TICK_EMOJI_ID,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Ввести ID",
+                    callback_data="adm_logs_set",
+                    style="primary",
+                    icon_custom_emoji_id=PEN_EMOJI_ID,
+                ),
+                InlineKeyboardButton(
+                    text="Удалить",
+                    callback_data="adm_logs_delete",
+                    style="danger",
+                    icon_custom_emoji_id=TRASH_EMOJI_ID,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Назад в админку",
+                    callback_data="admin_req_back",
+                    icon_custom_emoji_id=BACK_EMOJI_ID,
+                ),
             ],
         ]
     )
@@ -2980,6 +3107,63 @@ def _admin_panel_caption() -> str:
     )
 
 
+@dp.callback_query(F.data == "adm_logs")
+async def admin_logs_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+    await callback.answer()
+    await safe_edit_text(callback.message, text=admin_logs_caption(), reply_markup=admin_logs_inline())
+
+
+@dp.callback_query(F.data == "adm_logs_this")
+async def admin_logs_this_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+    set_setting("log_chat_id", str(callback.message.chat.id))
+    await callback.answer("Чат логов установлен", show_alert=True)
+    await safe_edit_text(callback.message, text=admin_logs_caption(), reply_markup=admin_logs_inline())
+    await send_admin_log(
+        callback.bot,
+        "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Чат логов подключен</b>\n"
+        f"<blockquote><b>Админ: {user_log_label(callback.from_user)}</b></blockquote>",
+    )
+
+
+@dp.callback_query(F.data == "adm_logs_set")
+async def admin_logs_set_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+    admin_log_state[callback.from_user.id] = {
+        "chat_id": callback.message.chat.id,
+        "message_id": callback.message.message_id,
+    }
+    await callback.answer("Жду ID чата", show_alert=True)
+    await safe_edit_text(
+        callback.message,
+        text=(
+            f"<b><tg-emoji emoji-id='{PEN_EMOJI_ID}'>✍️</tg-emoji> Введите ID чата логов</b>\n\n"
+            "<blockquote><b>Пример: <code>-1001234567890</code></b>\n"
+            "<b>Бот должен быть добавлен в этот чат и иметь право писать сообщения.</b></blockquote>\n\n"
+            "<i>/cancel — отмена</i>"
+        ),
+        reply_markup=None,
+    )
+
+
+@dp.callback_query(F.data == "adm_logs_delete")
+async def admin_logs_delete_handler(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Доступ запрещен", show_alert=True)
+        return
+    delete_setting("log_chat_id")
+    admin_log_state.pop(callback.from_user.id, None)
+    await callback.answer("Чат логов удален", show_alert=True)
+    await safe_edit_text(callback.message, text=admin_logs_caption(), reply_markup=admin_logs_inline())
+
+
 @dp.callback_query(F.data == "admin_reqadd")
 async def admin_reqadd_handler(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -3664,6 +3848,14 @@ async def promo_handler(message: Message):
         await message.answer("Промокод недействителен")
         return
     add_balance(message.from_user.id, amount)
+    await send_admin_log(
+        message.bot,
+        "<b><tg-emoji emoji-id='5874948844935974490'>⭐️</tg-emoji> Промокод активирован</b>\n"
+        f"<blockquote><b>Пользователь: {user_log_label(message.from_user)}</b>\n"
+        f"<b>Код: <code>{html.escape(code)}</code></b>\n"
+        f"<b>Начислено: {amount:.2f} {BALANCE_CURRENCY}</b>\n"
+        f"<b>Баланс: {get_balance(message.from_user.id):.2f} {BALANCE_CURRENCY}</b></blockquote>",
+    )
     await message.answer(
         f"Промокод активирован ✅\nНачислено: {amount:.2f} {BALANCE_CURRENCY}\nТекущий баланс: {get_balance(message.from_user.id):.2f} {BALANCE_CURRENCY}"
     )
@@ -3671,7 +3863,13 @@ async def promo_handler(message: Message):
 # 🚀 СТАРТ
 @dp.message(F.text == "/start")
 async def start_handler(message: Message):
-    ensure_user(message.from_user.id)
+    is_new_user = ensure_user(message.from_user.id)
+    if is_new_user:
+        await send_admin_log(
+            message.bot,
+            "<b><tg-emoji emoji-id='5260399854500191689'>👤</tg-emoji> Новый пользователь</b>\n"
+            f"<blockquote><b>{user_log_label(message.from_user)}</b></blockquote>",
+        )
     if is_banned(message.from_user.id):
         await message.answer("<b><tg-emoji emoji-id='5278578973595427038'>🚫</tg-emoji> Вы заблокированы администратором</b>")
         return
@@ -4054,6 +4252,48 @@ async def mail_text_message_handler(message: Message):
     await process_mailing_text_input(message)
 
 
+async def process_admin_log_text_input(message: Message) -> bool:
+    if not message.from_user or not is_admin(message.from_user.id):
+        return False
+    st = admin_log_state.get(message.from_user.id)
+    if not st:
+        return False
+    raw = (message.text or "").strip()
+    await safe_delete_message(message)
+    if raw.lower() in ("/cancel", "отмена"):
+        admin_log_state.pop(message.from_user.id, None)
+        await message.answer("Настройка логов отменена", reply_markup=admin_inline())
+        return True
+    try:
+        chat_id = int(raw)
+    except ValueError:
+        await message.answer(
+            "<b><tg-emoji emoji-id='5881702736843511327'>⚠️</tg-emoji> Неверный ID</b>\n\n"
+            "<blockquote><b>Нужен числовой ID, например <code>-1001234567890</code></b></blockquote>"
+        )
+        return True
+
+    set_setting("log_chat_id", str(chat_id))
+    admin_log_state.pop(message.from_user.id, None)
+    try:
+        await message.bot.edit_message_text(
+            chat_id=st.get("chat_id"),
+            message_id=st.get("message_id"),
+            text=admin_logs_caption(),
+            reply_markup=admin_logs_inline(),
+            parse_mode=ParseMode.HTML,
+        )
+    except TelegramBadRequest:
+        await message.answer(admin_logs_caption(), reply_markup=admin_logs_inline())
+
+    await send_admin_log(
+        message.bot,
+        "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Чат логов подключен</b>\n"
+        f"<blockquote><b>Админ: {user_log_label(message.from_user)}</b></blockquote>",
+    )
+    return True
+
+
 async def process_admin_broadcast_text_input(message: Message) -> bool:
     if not message.from_user or not is_admin(message.from_user.id):
         return False
@@ -4268,6 +4508,9 @@ async def rub_amount_input_handler(message: Message):
     if await process_admin_broadcast_text_input(message):
         return
 
+    if await process_admin_log_text_input(message):
+        return
+
     if await handle_mandatory_sub_admin_wizard(message):
         return
 
@@ -4450,6 +4693,14 @@ async def rub_amount_input_handler(message: Message):
             await message.answer("Промокод недействителен")
             return
         add_balance(message.from_user.id, amount)
+        await send_admin_log(
+            message.bot,
+            "<b><tg-emoji emoji-id='5874948844935974490'>⭐️</tg-emoji> Промокод активирован</b>\n"
+            f"<blockquote><b>Пользователь: {user_log_label(message.from_user)}</b>\n"
+            f"<b>Код: <code>{html.escape(code)}</code></b>\n"
+            f"<b>Начислено: {amount:.2f} {BALANCE_CURRENCY}</b>\n"
+            f"<b>Баланс: {get_balance(message.from_user.id):.2f} {BALANCE_CURRENCY}</b></blockquote>",
+        )
         await message.answer(
             f"Промокод активирован ✅\nНачислено: {amount:.2f} {BALANCE_CURRENCY}\n"
             f"Текущий баланс: {get_balance(message.from_user.id):.2f} {BALANCE_CURRENCY}"
@@ -4483,6 +4734,14 @@ async def rub_amount_input_handler(message: Message):
                 amount = float(parts[1])
                 uses = int(parts[2])
                 create_or_update_promo(code, amount, uses)
+                await send_admin_log(
+                    message.bot,
+                    "<b><tg-emoji emoji-id='5874948844935974490'>⭐️</tg-emoji> Промокод создан</b>\n"
+                    f"<blockquote><b>Админ: {user_log_label(message.from_user)}</b>\n"
+                    f"<b>Код: <code>{html.escape(code)}</code></b>\n"
+                    f"<b>Сумма: {amount:.2f} {BALANCE_CURRENCY}</b>\n"
+                    f"<b>Активаций: {uses}</b></blockquote>",
+                )
                 await message.answer(
                     "<b><tg-emoji emoji-id='5278411813468269386'>✅</tg-emoji> Промокод создан</b>\n"
                     f"<b><tg-emoji emoji-id='5276422526350681413'>🎁</tg-emoji> Код: <code>{code}</code></b>\n"
@@ -4493,6 +4752,14 @@ async def rub_amount_input_handler(message: Message):
                 target_id = int(parts[0])
                 amount = float(parts[1])
                 add_balance(target_id, amount)
+                await send_admin_log(
+                    message.bot,
+                    "<b><tg-emoji emoji-id='5255933397750014894'>💱</tg-emoji> Баланс выдан админом</b>\n"
+                    f"<blockquote><b>Админ: {user_log_label(message.from_user)}</b>\n"
+                    f"<b>Пользователь ID: <code>{target_id}</code></b>\n"
+                    f"<b>Сумма: {amount:.2f} {BALANCE_CURRENCY}</b>\n"
+                    f"<b>Баланс пользователя: {get_balance(target_id):.2f} {BALANCE_CURRENCY}</b></blockquote>",
+                )
                 await message.answer(
                     "<b><tg-emoji emoji-id='5278411813468269386'>✅</tg-emoji> Баланс выдан</b>\n"
                     f"<b><tg-emoji emoji-id='5275979556308674886'>👤</tg-emoji> ID: <code>{target_id}</code></b>\n"
@@ -4502,6 +4769,13 @@ async def rub_amount_input_handler(message: Message):
                 target_id = int(parts[0])
                 months = int(parts[1])
                 add_subscription_months(target_id, months)
+                await send_admin_log(
+                    message.bot,
+                    "<b><tg-emoji emoji-id='5345892681765645532'>💎</tg-emoji> Подписка выдана админом</b>\n"
+                    f"<blockquote><b>Админ: {user_log_label(message.from_user)}</b>\n"
+                    f"<b>Пользователь ID: <code>{target_id}</code></b>\n"
+                    f"<b>Месяцев: +{months}</b></blockquote>",
+                )
                 await message.answer(
                     "<b><tg-emoji emoji-id='5278411813468269386'>✅</tg-emoji> Подписка выдана</b>\n"
                     f"<b><tg-emoji emoji-id='5275979556308674886'>👤</tg-emoji> ID: <code>{target_id}</code></b>\n"
@@ -4550,6 +4824,14 @@ async def rub_amount_input_handler(message: Message):
         }
         awaiting_xrocket_amount.pop(message.from_user.id, None)
         asyncio.create_task(auto_check_xrocket_payment(message.from_user.id))
+        await send_admin_log(
+            message.bot,
+            "<b><tg-emoji emoji-id='5415897719522744378'>🚀</tg-emoji> Создан счет</b>\n"
+            f"<blockquote><b>Способ: XRocket</b>\n"
+            f"<b>Пользователь: {user_log_label(message.from_user)}</b>\n"
+            f"<b>Сумма: {rub_amount:.2f} {BALANCE_CURRENCY}</b>\n"
+            f"<b>Invoice ID: <code>{html.escape(str(invoice['id']))}</code></b></blockquote>",
+        )
 
         try:
             await message.bot.edit_message_caption(
@@ -4603,6 +4885,15 @@ async def rub_amount_input_handler(message: Message):
         }
         awaiting_ton_rub_amount.pop(message.from_user.id, None)
         asyncio.create_task(auto_check_ton_payment(message.from_user.id))
+        await send_admin_log(
+            message.bot,
+            "<b><tg-emoji emoji-id='5361914370068613491'>👛</tg-emoji> Создан счет</b>\n"
+            f"<blockquote><b>Способ: Tonkeeper</b>\n"
+            f"<b>Пользователь: {user_log_label(message.from_user)}</b>\n"
+            f"<b>Сумма: {rub_amount:.2f} {BALANCE_CURRENCY}</b>\n"
+            f"<b>TON: {ton_amount:.6f}</b>\n"
+            f"<b>Комментарий: <code>{html.escape(comment)}</code></b></blockquote>",
+        )
 
         try:
             await message.bot.edit_message_caption(
@@ -4651,6 +4942,14 @@ async def rub_amount_input_handler(message: Message):
     }
     awaiting_rub_amount.pop(message.from_user.id, None)
     asyncio.create_task(auto_check_payment(message.from_user.id))
+    await send_admin_log(
+        message.bot,
+        "<b><tg-emoji emoji-id='5361914370068613491'>👛</tg-emoji> Создан счет</b>\n"
+        f"<blockquote><b>Способ: CryptoBot</b>\n"
+        f"<b>Пользователь: {user_log_label(message.from_user)}</b>\n"
+        f"<b>Сумма: {rub_amount:.2f} {BALANCE_CURRENCY}</b>\n"
+        f"<b>Invoice ID: <code>{html.escape(str(invoice['invoice_id']))}</code></b></blockquote>",
+    )
 
     try:
         await message.bot.edit_message_caption(
@@ -4682,6 +4981,15 @@ async def check_xrocket_payment_handler(callback: CallbackQuery):
     if pending.get("paid") or invoice.get("status") == "paid":
         amount_rub = float(pending["rub_amount"])
         add_balance(callback.from_user.id, amount_rub)
+        await send_admin_log(
+            callback.bot,
+            "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Оплата зачислена</b>\n"
+            f"<blockquote><b>Способ: XRocket</b>\n"
+            f"<b>Пользователь: {user_log_label(callback.from_user)}</b>\n"
+            f"<b>Сумма: {amount_rub:.2f} {BALANCE_CURRENCY}</b>\n"
+            f"<b>Invoice ID: <code>{html.escape(str(pending['invoice_id']))}</code></b>\n"
+            f"<b>Баланс: {get_balance(callback.from_user.id):.2f} {BALANCE_CURRENCY}</b></blockquote>",
+        )
         pending_xrocket_invoices.pop(callback.from_user.id, None)
 
         await safe_edit_caption(
@@ -4720,6 +5028,15 @@ async def check_cryptobot_payment_handler(callback: CallbackQuery):
     if invoice.get("status") == "paid" or pending.get("paid"):
         amount_rub = float(pending["rub_amount"])
         add_balance(callback.from_user.id, amount_rub)
+        await send_admin_log(
+            callback.bot,
+            "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Оплата зачислена</b>\n"
+            f"<blockquote><b>Способ: CryptoBot</b>\n"
+            f"<b>Пользователь: {user_log_label(callback.from_user)}</b>\n"
+            f"<b>Сумма: {amount_rub:.2f} {BALANCE_CURRENCY}</b>\n"
+            f"<b>Invoice ID: <code>{html.escape(str(pending['invoice_id']))}</code></b>\n"
+            f"<b>Баланс: {get_balance(callback.from_user.id):.2f} {BALANCE_CURRENCY}</b></blockquote>",
+        )
         pending_invoices.pop(callback.from_user.id, None)
 
         await safe_edit_caption(
@@ -4753,6 +5070,15 @@ async def check_tonkeeper_payment_handler(callback: CallbackQuery):
     if paid or pending.get("paid"):
         amount_rub = float(pending["rub_amount"])
         add_balance(callback.from_user.id, amount_rub)
+        await send_admin_log(
+            callback.bot,
+            "<b><tg-emoji emoji-id='5776375003280838798'>✅</tg-emoji> Оплата зачислена</b>\n"
+            f"<blockquote><b>Способ: Tonkeeper</b>\n"
+            f"<b>Пользователь: {user_log_label(callback.from_user)}</b>\n"
+            f"<b>Сумма: {amount_rub:.2f} {BALANCE_CURRENCY}</b>\n"
+            f"<b>Комментарий: <code>{html.escape(str(pending['comment']))}</code></b>\n"
+            f"<b>Баланс: {get_balance(callback.from_user.id):.2f} {BALANCE_CURRENCY}</b></blockquote>",
+        )
         pending_ton_invoices.pop(callback.from_user.id, None)
 
         await safe_edit_caption(
@@ -5563,6 +5889,15 @@ async def sub_purchase_handler(callback: CallbackQuery):
         set_lifetime_access(callback.from_user.id, True)
     elif sub_type == "slots5":
         add_account_slots(callback.from_user.id, 5)
+
+    await send_admin_log(
+        callback.bot,
+        "<b><tg-emoji emoji-id='5345892681765645532'>💎</tg-emoji> Покупка тарифа</b>\n"
+        f"<blockquote><b>Пользователь: {user_log_label(callback.from_user)}</b>\n"
+        f"<b>Тариф: {html.escape(tariff_label)}</b>\n"
+        f"<b>Списано: {price:.2f} {BALANCE_CURRENCY}</b>\n"
+        f"<b>Остаток: {get_balance(callback.from_user.id):.2f} {BALANCE_CURRENCY}</b></blockquote>",
+    )
 
     await safe_edit_caption(
         callback.message,
