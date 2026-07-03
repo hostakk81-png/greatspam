@@ -2201,6 +2201,23 @@ def _dialog_type_label(dialog) -> str:
     return "Группа"
 
 
+def _iter_dialog_filters(result) -> list:
+    if result is None:
+        return []
+    if hasattr(result, "filters"):
+        return _iter_dialog_filters(getattr(result, "filters"))
+    if hasattr(result, "dialog_filters"):
+        return _iter_dialog_filters(getattr(result, "dialog_filters"))
+    if isinstance(result, (list, tuple, set)):
+        return list(result)
+    try:
+        return list(result)
+    except TypeError:
+        if hasattr(result, "id") or hasattr(result, "title"):
+            return [result]
+        return []
+
+
 async def load_account_folders(user_id: int, account_id: int) -> list[dict]:
     acc = get_account_by_id(account_id)
     if not acc or acc["user_id"] != user_id:
@@ -2211,13 +2228,14 @@ async def load_account_folders(user_id: int, account_id: int) -> list[dict]:
     folders = [{"key": "main", "title": "Основные"}, {"key": "archive", "title": "Архив"}]
     try:
         if GetDialogFiltersRequest is not None:
-            filters = await client(GetDialogFiltersRequest())
-            for f in filters:
+            filters_result = await client(GetDialogFiltersRequest())
+            for f in _iter_dialog_filters(filters_result):
                 fid = int(getattr(f, "id", 0) or 0)
                 if fid <= 0:
                     continue
                 title = getattr(f, "title", None) or f"Папка {fid}"
-                folders.append({"key": f"f{fid}", "title": str(title)})
+                title_text = getattr(title, "text", title)
+                folders.append({"key": f"f{fid}", "title": str(title_text)})
     except Exception:
         logger.exception("load dialog folders failed account_id=%s", account_id)
     finally:
