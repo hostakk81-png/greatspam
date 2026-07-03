@@ -1714,8 +1714,8 @@ def _set_mailing_wait(callback: CallbackQuery, stage: str) -> None:
 def mailing_settings_message_caption(user_id: int) -> str:
     cfg = mex.get_mailing_config(DB_PATH, user_id)
     iv = cfg["interval_sec"]
-    ch = cfg["chats_filter"]
     selected_chats = len(mex.get_selected_chat_ids(DB_PATH, user_id))
+    ch = f"конкретные ({selected_chats})" if selected_chats else cfg["chats_filter"]
     au = cfg["autostart_str"] or "выкл"
     vn = mex.count_filled_variants(cfg)
     return (
@@ -1894,45 +1894,68 @@ async def refresh_mail_settings_after_input(
     )
 
 
-def chats_filter_inline(current: str):
+def mail_chats_caption(user_id: int) -> str:
+    cfg = mex.get_mailing_config(DB_PATH, user_id)
+    selected_count = len(mex.get_selected_chat_ids(DB_PATH, user_id))
+    if selected_count:
+        mode = f"Конкретные чаты: {selected_count}"
+        hint = "Рассылка пойдёт только в выбранные чаты. Типы «Все/Личные/Группы/Каналы» сейчас не используются."
+    else:
+        mode = f"Тип чатов: {cfg['chats_filter']}"
+        hint = "Выберите общий тип чатов или откройте конкретный выбор."
+    return (
+        "<b><tg-emoji emoji-id='5298668674532538341'>👥️</tg-emoji> Куда слать</b>\n\n"
+        f"<blockquote><b><tg-emoji emoji-id='5278411813468269386'>✅</tg-emoji> {html.escape(mode)}</b>\n"
+        f"<b><tg-emoji emoji-id='5278753302023004775'>ℹ️</tg-emoji> {html.escape(hint)}</b></blockquote>"
+    )
+
+
+def chats_filter_inline(current: str, selected_count: int = 0):
     def mark(name, val):
-        prefix = "✓ " if current == val else ""
+        prefix = "✓ " if selected_count == 0 and current == val else ""
         return f"{prefix}{name}"
 
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=mark("Все", "all"),
-                    callback_data="mail_chat_all",
-                    icon_custom_emoji_id="5276111746812112286",  # ⭐️
-                ),
-                InlineKeyboardButton(
-                    text=mark("Личные", "private"),
-                    callback_data="mail_chat_private",
-                    icon_custom_emoji_id="5275979556308674886",  # 👤
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text=mark("Группы", "groups"),
-                    callback_data="mail_chat_groups",
-                    icon_custom_emoji_id="5298668674532538341",  # 👥️
-                ),
-                InlineKeyboardButton(
-                    text=mark("Каналы", "channels"),
-                    callback_data="mail_chat_channels",
-                    icon_custom_emoji_id="5278528159837348960",  # 📢
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Выбрать конкретные чаты",
-                    callback_data="mail_chat_accounts",
-                    style="primary",
-                    icon_custom_emoji_id="5276395476646653290",
-                )
-            ],
+    specific_text = (
+        f"✓ Конкретные чаты: {selected_count}"
+        if selected_count
+        else "Выбрать конкретные чаты"
+    )
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=mark("Все", "all"),
+                callback_data="mail_chat_all",
+                icon_custom_emoji_id="5276111746812112286",  # ⭐️
+            ),
+            InlineKeyboardButton(
+                text=mark("Личные", "private"),
+                callback_data="mail_chat_private",
+                icon_custom_emoji_id="5275979556308674886",  # 👤
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=mark("Группы", "groups"),
+                callback_data="mail_chat_groups",
+                icon_custom_emoji_id="5298668674532538341",  # 👥️
+            ),
+            InlineKeyboardButton(
+                text=mark("Каналы", "channels"),
+                callback_data="mail_chat_channels",
+                icon_custom_emoji_id="5278528159837348960",  # 📢
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text=specific_text,
+                callback_data="mail_chat_accounts",
+                style="success" if selected_count else "primary",
+                icon_custom_emoji_id="5276395476646653290",
+            )
+        ],
+    ]
+    if selected_count:
+        rows.append(
             [
                 InlineKeyboardButton(
                     text="Сбросить конкретный выбор",
@@ -1940,15 +1963,19 @@ def chats_filter_inline(current: str):
                     style="danger",
                     icon_custom_emoji_id="5276384644739129761",
                 )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Назад",
-                    callback_data="mail_settings",
-                    icon_custom_emoji_id="5206510891247371052",  # 🔽
-                )
-            ],
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Назад",
+                callback_data="mail_settings",
+                icon_custom_emoji_id="5206510891247371052",  # 🔽
+            )
         ]
+    )
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
     )
 
 
@@ -2263,6 +2290,72 @@ def _iter_dialog_filters(result) -> list:
         return []
 
 
+def _peer_id_safe(peer) -> int | None:
+    try:
+        return int(tl_utils.get_peer_id(peer))
+    except Exception:
+        pass
+    raw_id = getattr(peer, "channel_id", None)
+    if raw_id is not None:
+        return int(f"-100{raw_id}")
+    raw_id = getattr(peer, "chat_id", None)
+    if raw_id is not None:
+        return -int(raw_id)
+    raw_id = getattr(peer, "user_id", None)
+    if raw_id is not None:
+        return int(raw_id)
+    raw_id = getattr(peer, "id", None)
+    return int(raw_id) if raw_id is not None else None
+
+
+def _peer_id_set(peers) -> set[int]:
+    out: set[int] = set()
+    for peer in peers or []:
+        pid = _peer_id_safe(peer)
+        if pid is not None:
+            out.add(pid)
+    return out
+
+
+def _dialog_matches_telegram_filter(dialog, dialog_filter) -> bool:
+    ent = dialog.entity
+    peer_id = _peer_id_safe(ent)
+    include_peers = _peer_id_set(getattr(dialog_filter, "include_peers", None))
+    pinned_peers = _peer_id_set(getattr(dialog_filter, "pinned_peers", None))
+    exclude_peers = _peer_id_set(getattr(dialog_filter, "exclude_peers", None))
+
+    if peer_id in exclude_peers:
+        return False
+    if include_peers or pinned_peers:
+        if peer_id in include_peers or peer_id in pinned_peers:
+            return True
+
+    is_user = bool(getattr(dialog, "is_user", False))
+    is_channel = bool(getattr(dialog, "is_channel", False))
+    is_group = bool(getattr(dialog, "is_group", False)) or (
+        is_channel and bool(getattr(ent, "megagroup", False))
+    )
+    is_broadcast = is_channel and not bool(getattr(ent, "megagroup", False))
+    is_bot = is_user and bool(getattr(ent, "bot", False))
+    is_contact = is_user and bool(getattr(ent, "contact", False))
+
+    matched_by_flag = False
+    if getattr(dialog_filter, "groups", False) and is_group:
+        matched_by_flag = True
+    if getattr(dialog_filter, "broadcasts", False) and is_broadcast:
+        matched_by_flag = True
+    if getattr(dialog_filter, "bots", False) and is_bot:
+        matched_by_flag = True
+    if getattr(dialog_filter, "contacts", False) and is_contact:
+        matched_by_flag = True
+    if getattr(dialog_filter, "non_contacts", False) and is_user and not is_contact and not is_bot:
+        matched_by_flag = True
+
+    if include_peers or pinned_peers:
+        return matched_by_flag
+    return matched_by_flag
+
+
 async def load_account_folders(user_id: int, account_id: int) -> list[dict]:
     acc = get_account_by_id(account_id)
     if not acc or acc["user_id"] != user_id:
@@ -2305,12 +2398,21 @@ async def load_account_dialogs(
     q = (query or "").strip().lower()
     try:
         kwargs: dict[str, Any] = {}
-        wanted_folder_id: int | None = None
+        telegram_filter = None
         if folder_key == "archive":
             kwargs["archived"] = True
         elif folder_key.startswith("f") and folder_key[1:].isdigit():
             kwargs["archived"] = False
-            wanted_folder_id = int(folder_key[1:])
+            wanted_filter_id = int(folder_key[1:])
+            if GetDialogFiltersRequest is not None:
+                filters_result = await client(GetDialogFiltersRequest())
+                for f in _iter_dialog_filters(filters_result):
+                    if int(getattr(f, "id", 0) or 0) == wanted_filter_id:
+                        telegram_filter = f
+                        break
+            if telegram_filter is None:
+                logger.warning("telegram dialog filter not found account_id=%s folder=%s", account_id, folder_key)
+                return []
         else:
             kwargs["archived"] = False
         try:
@@ -2318,11 +2420,8 @@ async def load_account_dialogs(
         except TypeError:
             iterator = client.iter_dialogs(archived=(folder_key == "archive"))
         async for dialog in iterator:
-            if wanted_folder_id is not None:
-                dialog_folder_id = getattr(dialog, "folder_id", None)
-                if dialog_folder_id is None:
-                    dialog_folder_id = getattr(getattr(dialog, "dialog", None), "folder_id", None)
-                if int(dialog_folder_id or 0) != wanted_folder_id:
+            if telegram_filter is not None:
+                if not _dialog_matches_telegram_filter(dialog, telegram_filter):
                     continue
             name = (getattr(dialog, "name", None) or "").strip() or "Без названия"
             if q and q not in name.lower():
@@ -5035,13 +5134,11 @@ async def mail_set_chats_handler(callback: CallbackQuery):
     if is_banned(callback.from_user.id):
         return
     cfg = mex.get_mailing_config(DB_PATH, callback.from_user.id)
+    selected_count = len(mex.get_selected_chat_ids(DB_PATH, callback.from_user.id))
     await safe_edit_caption(
         callback.message,
-        caption=(
-            "<b><tg-emoji emoji-id='5298668674532538341'>👥️</tg-emoji> Куда слать</b>\n\n"
-            "<blockquote><b><tg-emoji emoji-id='5278753302023004775'>ℹ️</tg-emoji> Выберите тип чатов для одного круга рассылки</b></blockquote>"
-        ),
-        reply_markup=chats_filter_inline(cfg["chats_filter"]),
+        caption=mail_chats_caption(callback.from_user.id),
+        reply_markup=chats_filter_inline(cfg["chats_filter"], selected_count),
     )
 
 
@@ -5053,16 +5150,16 @@ async def mail_chat_filter_handler(callback: CallbackQuery):
     mapping = {"all": "all", "private": "private", "groups": "groups", "channels": "channels"}
     if key not in mapping:
         return
+    had_selected = bool(mex.get_selected_chat_ids(DB_PATH, callback.from_user.id))
+    if had_selected:
+        mex.clear_selected_chats(DB_PATH, callback.from_user.id)
     mex.set_mailing_field(DB_PATH, callback.from_user.id, chats_filter=mapping[key])
     await safe_edit_caption(
         callback.message,
-        caption=(
-            "<b><tg-emoji emoji-id='5298668674532538341'>👥️</tg-emoji> Куда слать</b>\n\n"
-            f"<blockquote><b><tg-emoji emoji-id='5278411813468269386'>✅</tg-emoji> Выбрано: <code>{mapping[key]}</code></b></blockquote>"
-        ),
-        reply_markup=chats_filter_inline(mapping[key]),
+        caption=mail_chats_caption(callback.from_user.id),
+        reply_markup=chats_filter_inline(mapping[key], 0),
     )
-    await callback.answer("Сохранено")
+    await callback.answer("Тип выбран, конкретные чаты сброшены" if had_selected else "Сохранено")
 
 
 @dp.callback_query(F.data == "mail_chat_clear_selected")
@@ -5073,11 +5170,8 @@ async def mail_chat_clear_selected_handler(callback: CallbackQuery):
     cfg = mex.get_mailing_config(DB_PATH, callback.from_user.id)
     await safe_edit_caption(
         callback.message,
-        caption=(
-            "<b><tg-emoji emoji-id='5298668674532538341'>👥️</tg-emoji> Куда слать</b>\n\n"
-            "<blockquote><b><tg-emoji emoji-id='5278411813468269386'>✅</tg-emoji> Конкретный выбор чатов сброшен</b></blockquote>"
-        ),
-        reply_markup=chats_filter_inline(cfg["chats_filter"]),
+        caption=mail_chats_caption(callback.from_user.id),
+        reply_markup=chats_filter_inline(cfg["chats_filter"], 0),
     )
     await callback.answer("Выбор очищен")
 
