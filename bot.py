@@ -6,6 +6,7 @@ import sqlite3
 import html
 import os
 import re
+import shutil
 import unicodedata
 import logging
 from urllib.parse import urlparse
@@ -37,6 +38,7 @@ from telethon.errors import (
     PhoneNumberAppSignupForbiddenError,
     PhoneMigrateError,
 )
+from telethon.errors.rpcerrorlist import FolderIdInvalidError
 try:
     from telethon.tl.functions.messages import GetDialogFiltersRequest
 except ImportError:
@@ -67,9 +69,19 @@ awaiting_ton_rub_amount = {}
 awaiting_promo_input = {}
 admin_action_state = {}
 admin_broadcast_state = {}
-DB_PATH = "blackwire.db"
-SESSIONS_DIR = "sessions"
 _BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.abspath(
+    os.getenv(
+        "DATA_DIR",
+        os.getenv(
+            "RAILWAY_VOLUME_MOUNT_PATH",
+            os.getenv("PERSISTENT_DATA_DIR", _BOT_DIR),
+        ),
+    )
+)
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "blackwire.db"))
+SESSIONS_DIR = os.getenv("SESSIONS_DIR", os.path.join(DATA_DIR, "sessions"))
 account_login_state = {}
 mailing_input_state = {}
 mailing_tasks = {}
@@ -78,8 +90,11 @@ ACC_PAGE_SIZE = 5
 CHAT_PAGE_SIZE = 6
 DEFAULT_ACCOUNT_SLOTS = 5
 BALANCE_CURRENCY = "USDT"
-MAILING_MEDIA_DIR = os.path.join(_BOT_DIR, "mailing_media")
-ADMIN_BROADCAST_MEDIA_DIR = os.path.join(_BOT_DIR, "admin_broadcast_media")
+MAILING_MEDIA_DIR = os.getenv("MAILING_MEDIA_DIR", os.path.join(DATA_DIR, "mailing_media"))
+ADMIN_BROADCAST_MEDIA_DIR = os.getenv(
+    "ADMIN_BROADCAST_MEDIA_DIR",
+    os.path.join(DATA_DIR, "admin_broadcast_media"),
+)
 DEFAULT_BANNER_PATH = os.path.join(_BOT_DIR, "media", "banner.png")
 DEFAULT_MAILING_VIDEO_PATH = DEFAULT_BANNER_PATH
 
@@ -104,6 +119,36 @@ def is_admin(user_id: int | None) -> bool:
     if user_id is None:
         return False
     return int(user_id) in ADMIN_IDS
+
+
+def prepare_persistent_storage() -> None:
+    for path in (DATA_DIR, SESSIONS_DIR, MAILING_MEDIA_DIR, ADMIN_BROADCAST_MEDIA_DIR):
+        os.makedirs(path, exist_ok=True)
+
+    old_db = os.path.join(_BOT_DIR, "blackwire.db")
+    if os.path.abspath(DB_PATH) != os.path.abspath(old_db):
+        db_parent = os.path.dirname(os.path.abspath(DB_PATH))
+        if db_parent:
+            os.makedirs(db_parent, exist_ok=True)
+        if os.path.isfile(old_db) and not os.path.exists(DB_PATH):
+            try:
+                shutil.copy2(old_db, DB_PATH)
+                logger.info("Copied existing DB to persistent storage: %s", DB_PATH)
+            except OSError:
+                logger.exception("Failed to copy DB to persistent storage")
+
+    old_sessions = os.path.join(_BOT_DIR, "sessions")
+    if os.path.abspath(SESSIONS_DIR) != os.path.abspath(old_sessions) and os.path.isdir(old_sessions):
+        for name in os.listdir(old_sessions):
+            if not name.endswith((".session", ".session-journal")):
+                continue
+            src = os.path.join(old_sessions, name)
+            dst = os.path.join(SESSIONS_DIR, name)
+            if os.path.isfile(src) and not os.path.exists(dst):
+                try:
+                    shutil.copy2(src, dst)
+                except OSError:
+                    logger.exception("Failed to copy session file to persistent storage: %s", name)
 
 PEN_EMOJI_ID = "5258331647358540449"
 INFO_EMOJI_ID = "5258503720928288433"
@@ -5438,6 +5483,10 @@ async def sub_purchase_handler(callback: CallbackQuery):
     )
 
 async def main():
+    prepare_persistent_storage()
+    logger.info("Persistent data dir: %s", DATA_DIR)
+    logger.info("SQLite DB path: %s", DB_PATH)
+    logger.info("Sessions dir: %s", SESSIONS_DIR)
     init_db()
     dp.message.middleware(MandatorySubMiddleware())
     dp.callback_query.middleware(MandatorySubMiddleware())

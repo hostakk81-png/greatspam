@@ -553,6 +553,11 @@ def resolve_session_path(session_stored: str) -> str:
     if os.path.isabs(p):
         candidates.append(p)
     else:
+        data_dir = os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.getenv("PERSISTENT_DATA_DIR")
+        if data_dir:
+            data_dir = os.path.abspath(data_dir)
+            candidates.append(os.path.join(data_dir, p))
+            candidates.append(os.path.join(data_dir, "sessions", os.path.basename(p)))
         candidates.append(os.path.join(root, p))
         candidates.append(os.path.abspath(p))
     for base in candidates:
