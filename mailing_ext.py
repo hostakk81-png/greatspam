@@ -946,16 +946,22 @@ async def run_mailing_loop(
                 n_try = 0
                 n_ok = 0
                 n_err = 0
+                n_seen = 0
+                n_filter_match = 0
+                n_selected_match = 0
                 _prune_slowmode_skip()
                 async for dialog in iter_dialogs_including_archived(client):
+                    n_seen += 1
                     if not dialog_matches_filter(dialog, flt):
                         continue
+                    n_filter_match += 1
                     ent = dialog.entity
                     if isinstance(ent, User) and me and ent.id == me.id:
                         continue
                     peer_id = tl_utils.get_peer_id(ent)
                     if selected_chat_ids and peer_id not in selected_chat_ids:
                         continue
+                    n_selected_match += 1
                     sk = _slowmode_skip.get((user_id, acc_id, peer_id))
                     if sk and time.monotonic() < sk:
                         continue
@@ -1115,6 +1121,13 @@ async def run_mailing_loop(
                     if MAIL_PEER_DELAY_SEC > 0:
                         await asyncio.sleep(MAIL_PEER_DELAY_SEC)
                 if log_fn:
+                    if n_try == 0:
+                        await log_fn(
+                            f"Аккаунт +{acc['phone']}: подходящих чатов для отправки 0 "
+                            f"(всего диалогов {n_seen}, подходит по типу {n_filter_match}, "
+                            f"после конкретного выбора {n_selected_match}). "
+                            "Проверьте режим «Чаты» и выбранные конкретные чаты."
+                        )
                     await log_fn(
                         f"Аккаунт +{acc['phone']}: готово — попыток отправки {n_try}, "
                         f"успешно {n_ok}, с ошибками/FloodWait {n_err}"
