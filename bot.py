@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 import mailing_ext as mex
 
-TOKEN = "8968384221:AAEMWGn-k-YLS2C3XGmMHrrk3TCjaMrZ32w"
+TOKEN = "8968384221:AAEf9nbMDc6NDlrmVLX9LrOuDQtI1vmXCD0"
 CRYPTO_PAY_TOKEN = "604180:AASnBhWqYHjnSOK1FuscIPbPXisSP3ALMg2"
 CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
 XROCKET_PAY_TOKEN = os.getenv("XROCKET_PAY_TOKEN", "89cb8571af90a147128132018")
