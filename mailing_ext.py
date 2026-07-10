@@ -120,6 +120,9 @@ def init_mailing_table(conn: sqlite3.Connection) -> None:
             selected_account_ids TEXT NOT NULL DEFAULT '[]',
             selected_chat_ids_json TEXT NOT NULL DEFAULT '[]',
             is_running INTEGER NOT NULL DEFAULT 0,
+            autojoin_links_json TEXT NOT NULL DEFAULT '[]',
+            autojoin_interval_sec INTEGER NOT NULL DEFAULT 300,
+            autojoin_running INTEGER NOT NULL DEFAULT 0,
             postbot_code TEXT NOT NULL DEFAULT '',
             body_variants_json TEXT NOT NULL DEFAULT '[]'
         )
@@ -138,6 +141,18 @@ def init_mailing_table(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE mailing_config ADD COLUMN selected_chat_ids_json TEXT NOT NULL DEFAULT '[]'"
         )
+    if "autojoin_links_json" not in cols:
+        conn.execute(
+            "ALTER TABLE mailing_config ADD COLUMN autojoin_links_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "autojoin_interval_sec" not in cols:
+        conn.execute(
+            "ALTER TABLE mailing_config ADD COLUMN autojoin_interval_sec INTEGER NOT NULL DEFAULT 300"
+        )
+    if "autojoin_running" not in cols:
+        conn.execute(
+            "ALTER TABLE mailing_config ADD COLUMN autojoin_running INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _conn(db_path: str) -> sqlite3.Connection:
@@ -149,7 +164,7 @@ def get_mailing_config(db_path: str, user_id: int) -> dict:
         row = conn.execute(
             "SELECT body_text, body_entities_json, interval_sec, autostart_str, buttons_json, "
             "chats_filter, media_path, media_type, selected_account_ids, is_running, postbot_code, "
-            "body_variants_json, selected_chat_ids_json "
+            "body_variants_json, selected_chat_ids_json, autojoin_links_json, autojoin_interval_sec, autojoin_running "
             "FROM mailing_config WHERE user_id = ?",
             (user_id,),
         ).fetchone()
@@ -166,6 +181,9 @@ def get_mailing_config(db_path: str, user_id: int) -> dict:
             "selected_account_ids": "[]",
             "selected_chat_ids_json": "[]",
             "is_running": 0,
+            "autojoin_links_json": "[]",
+            "autojoin_interval_sec": 300,
+            "autojoin_running": 0,
             "postbot_code": "",
             "body_variants_json": "[]",
         }
@@ -183,6 +201,9 @@ def get_mailing_config(db_path: str, user_id: int) -> dict:
         "is_running": int(row[9] or 0),
         "postbot_code": row[10] or "",
         "body_variants_json": row[11] if len(row) > 11 and row[11] is not None else "[]",
+        "autojoin_links_json": row[13] if len(row) > 13 and row[13] is not None else "[]",
+        "autojoin_interval_sec": int(row[14] if len(row) > 14 and row[14] is not None else 300),
+        "autojoin_running": int(row[15] if len(row) > 15 and row[15] is not None else 0),
     }
 
 
@@ -195,8 +216,9 @@ def _upsert(db_path: str, user_id: int, **fields) -> None:
             INSERT INTO mailing_config(
                 user_id, body_text, body_entities_json, interval_sec, autostart_str,
                 buttons_json, chats_filter, media_path, media_type, selected_account_ids, is_running,
-                postbot_code, body_variants_json, selected_chat_ids_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                postbot_code, body_variants_json, selected_chat_ids_json,
+                autojoin_links_json, autojoin_interval_sec, autojoin_running
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(user_id) DO UPDATE SET
                 body_text = excluded.body_text,
                 body_entities_json = excluded.body_entities_json,
@@ -210,7 +232,10 @@ def _upsert(db_path: str, user_id: int, **fields) -> None:
                 selected_chat_ids_json = excluded.selected_chat_ids_json,
                 is_running = excluded.is_running,
                 postbot_code = excluded.postbot_code,
-                body_variants_json = excluded.body_variants_json
+                body_variants_json = excluded.body_variants_json,
+                autojoin_links_json = excluded.autojoin_links_json,
+                autojoin_interval_sec = excluded.autojoin_interval_sec,
+                autojoin_running = excluded.autojoin_running
             """,
             (
                 user_id,
@@ -227,6 +252,9 @@ def _upsert(db_path: str, user_id: int, **fields) -> None:
                 cfg.get("postbot_code", "") or "",
                 cfg.get("body_variants_json", "") or "[]",
                 cfg.get("selected_chat_ids_json", "") or "[]",
+                cfg.get("autojoin_links_json", "") or "[]",
+                int(cfg.get("autojoin_interval_sec") or 300),
+                int(cfg.get("autojoin_running") or 0),
             ),
         )
         conn.commit()
@@ -286,6 +314,65 @@ def clear_selected_chats(db_path: str, user_id: int) -> None:
 
 def set_running(db_path: str, user_id: int, on: bool) -> None:
     set_mailing_field(db_path, user_id, is_running=1 if on else 0)
+
+
+def set_autojoin_running(db_path: str, user_id: int, on: bool) -> None:
+    set_mailing_field(db_path, user_id, autojoin_running=1 if on else 0)
+
+
+def normalize_autojoin_links(raw: str) -> list[str]:
+    text = raw or ""
+    found: list[str] = []
+    for m in re.finditer(
+        r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/(?:joinchat/|\+)([A-Za-z0-9_-]{4,120})",
+        text,
+        flags=re.I,
+    ):
+        token = m.group(1).strip()
+        if token:
+            found.append(f"https://t.me/+{token}")
+    for m in re.finditer(
+        r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,31})\b",
+        text,
+        flags=re.I,
+    ):
+        found.append("@" + m.group(1))
+    for m in re.finditer(r"(?<!\w)@([A-Za-z][A-Za-z0-9_]{3,31})\b", text):
+        found.append("@" + m.group(1))
+    for part in re.split(r"[\s,;]+", text):
+        p = part.strip()
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,31}", p):
+            found.append("@" + p)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for link in found:
+        key = link.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(link)
+    return out
+
+
+def get_autojoin_links(db_path: str, user_id: int) -> list[str]:
+    raw = get_mailing_config(db_path, user_id).get("autojoin_links_json") or "[]"
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = []
+    if not isinstance(data, list):
+        data = []
+    return normalize_autojoin_links("\n".join(str(x) for x in data))
+
+
+def set_autojoin_links(db_path: str, user_id: int, links: list[str]) -> None:
+    clean = normalize_autojoin_links("\n".join(links))
+    set_mailing_field(
+        db_path,
+        user_id,
+        autojoin_links_json=json.dumps(clean, ensure_ascii=False),
+    )
 
 
 def normalize_variants(raw: str | None) -> list[dict[str, str]]:
@@ -708,6 +795,138 @@ async def try_join_channels_from_chat_hints(
             exc_info=True,
         )
     return progressed
+
+
+def _autojoin_target(link: str) -> tuple[str, str] | None:
+    s = (link or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:joinchat/|\+)([A-Za-z0-9_-]{4,120})", s, flags=re.I)
+    if m:
+        return "invite", m.group(1)
+    if s.startswith("@") and re.fullmatch(r"@[A-Za-z][A-Za-z0-9_]{3,31}", s):
+        return "username", s[1:]
+    m = re.search(r"(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,31})\b", s, flags=re.I)
+    if m:
+        return "username", m.group(1)
+    return None
+
+
+async def join_autojoin_link(client: TelegramClient, link: str) -> str:
+    target = _autojoin_target(link)
+    if not target:
+        return "bad_link"
+    kind, value = target
+    try:
+        if kind == "invite":
+            await client(ImportChatInviteRequest(value))
+        else:
+            ent = await client.get_entity(value)
+            await client(JoinChannelRequest(ent))
+        return "joined"
+    except UserAlreadyParticipantError:
+        return "already"
+
+
+async def run_autojoin_loop(
+    db_path: str,
+    user_id: int,
+    tg_api_id: int,
+    tg_api_hash: str,
+    get_accounts_for_user,
+    log_fn=None,
+) -> None:
+    while True:
+        cfg = get_mailing_config(db_path, user_id)
+        if not int(cfg.get("autojoin_running") or 0):
+            return
+
+        links = get_autojoin_links(db_path, user_id)
+        ids = get_selected_ids(db_path, user_id)
+        if not links:
+            if log_fn:
+                await log_fn("Автовступление остановлено: список ссылок пуст.")
+            set_autojoin_running(db_path, user_id, False)
+            return
+        if not ids:
+            if log_fn:
+                await log_fn("Автовступление остановлено: не выбран ни один аккаунт.")
+            set_autojoin_running(db_path, user_id, False)
+            return
+
+        if log_fn:
+            await log_fn(f"Автовступление: круг — аккаунтов {len(ids)}, ссылок {len(links)}.")
+
+        for acc_id in ids:
+            cfg_now = get_mailing_config(db_path, user_id)
+            if not int(cfg_now.get("autojoin_running") or 0):
+                return
+            acc = get_accounts_for_user(acc_id, user_id)
+            if not acc:
+                if log_fn:
+                    await log_fn(f"Автовступление: аккаунт id={acc_id} не найден или чужой — пропуск.")
+                continue
+            session_path = resolve_session_path(acc["session_name"])
+            if not session_path or not os.path.isfile(session_path + ".session"):
+                if log_fn:
+                    await log_fn(f"Автовступление: файл сессии не найден: +{acc.get('phone', '')}")
+                continue
+            client = TelegramClient(session_path, tg_api_id, tg_api_hash)
+            joined = 0
+            already = 0
+            errors = 0
+            try:
+                await client.connect()
+                if not await client.is_user_authorized():
+                    if log_fn:
+                        await log_fn(f"Автовступление: сессия не авторизована: +{acc['phone']}")
+                    continue
+                for link in links:
+                    try:
+                        result = await join_autojoin_link(client, link)
+                        if result == "joined":
+                            joined += 1
+                            if log_fn:
+                                await log_fn(f"Автовступление +{acc['phone']}: вступил — {link}")
+                        elif result == "already":
+                            already += 1
+                        else:
+                            errors += 1
+                            if log_fn:
+                                await log_fn(f"Автовступление +{acc['phone']}: неверная ссылка — {link}")
+                    except FloodWaitError as e:
+                        errors += 1
+                        if log_fn:
+                            await log_fn(f"Автовступление +{acc['phone']}: FloodWait {e.seconds}s, пауза")
+                        await asyncio.sleep(min(int(e.seconds) + 1, 300))
+                    except FloodPremiumWaitError as e:
+                        errors += 1
+                        seconds = int(getattr(e, "seconds", 60) or 60)
+                        if log_fn:
+                            await log_fn(f"Автовступление +{acc['phone']}: FloodPremiumWait {seconds}s, пауза")
+                        await asyncio.sleep(min(seconds + 1, 300))
+                    except Exception as e:
+                        errors += 1
+                        logger.warning("autojoin failed account=%s link=%s: %s", acc_id, link, e, exc_info=True)
+                        if log_fn:
+                            await log_fn(f"Автовступление +{acc['phone']}: ошибка {link} — {str(e)[:250]}")
+                    await asyncio.sleep(1)
+                if log_fn:
+                    await log_fn(
+                        f"Автовступление +{acc['phone']}: круг готов — вступил {joined}, уже был {already}, ошибок {errors}"
+                    )
+            finally:
+                await client.disconnect()
+
+        interval = max(30, int(get_mailing_config(db_path, user_id).get("autojoin_interval_sec") or 300))
+        if log_fn:
+            await log_fn(f"Автовступление: круг завершён. Пауза {interval} сек.")
+        for _ in range(interval):
+            if not int(get_mailing_config(db_path, user_id).get("autojoin_running") or 0):
+                if log_fn:
+                    await log_fn("Автовступление остановлено.")
+                return
+            await asyncio.sleep(1)
 
 
 async def send_one_broadcast(

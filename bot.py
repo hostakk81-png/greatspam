@@ -86,6 +86,7 @@ SESSIONS_DIR = os.getenv("SESSIONS_DIR", os.path.join(DATA_DIR, "sessions"))
 account_login_state = {}
 mailing_input_state = {}
 mailing_tasks = {}
+autojoin_tasks = {}
 mandatory_sub_admin_state: dict[int, dict] = {}
 ACC_PAGE_SIZE = 5
 CHAT_PAGE_SIZE = 6
@@ -2013,6 +2014,14 @@ def settings_mail_inline():
             ],
             [
                 InlineKeyboardButton(
+                    text="Автовступление",
+                    callback_data="mail_autojoin",
+                    style="primary",
+                    icon_custom_emoji_id="5771695636411847302",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="Предпросмотр",
                     callback_data="mail_preview",
                     style="primary",
@@ -2033,6 +2042,80 @@ def settings_mail_inline():
                     callback_data="mail",
                     icon_custom_emoji_id="5206510891247371052",  # 🔽
                 )
+            ],
+        ]
+    )
+
+
+def mail_autojoin_caption(user_id: int) -> str:
+    cfg = mex.get_mailing_config(DB_PATH, user_id)
+    links = mex.get_autojoin_links(DB_PATH, user_id)
+    selected_accounts = len(mex.get_selected_ids(DB_PATH, user_id))
+    running = "вкл" if int(cfg.get("autojoin_running") or 0) else "выкл"
+    interval = int(cfg.get("autojoin_interval_sec") or 300)
+    sample = "\n".join(f"• <code>{html.escape(link)}</code>" for link in links[:5])
+    if len(links) > 5:
+        sample += f"\n• ... ещё {len(links) - 5}"
+    if not sample:
+        sample = "• <code>список пуст</code>"
+    return (
+        "<b><tg-emoji emoji-id='5771695636411847302'>📢</tg-emoji> Автовступление в чаты</b>\n\n"
+        "<blockquote>"
+        f"<b>Статус: <code>{running}</code></b>\n"
+        f"<b>Интервал: <code>{interval}</code> сек</b>\n"
+        f"<b>Ссылок: <code>{len(links)}</code></b>\n"
+        f"<b>Выбрано аккаунтов: <code>{selected_accounts}</code></b>"
+        "</blockquote>\n\n"
+        "<blockquote>"
+        "<b>Ссылки:</b>\n"
+        f"{sample}"
+        "</blockquote>"
+    )
+
+
+def mail_autojoin_inline(user_id: int) -> InlineKeyboardMarkup:
+    cfg = mex.get_mailing_config(DB_PATH, user_id)
+    running = bool(int(cfg.get("autojoin_running") or 0))
+    run_text = "Остановить" if running else "Запустить"
+    run_cb = "mail_autojoin_stop" if running else "mail_autojoin_start"
+    run_style = "danger" if running else "success"
+    run_icon = CROSS_EMOJI_ID if running else TICK_EMOJI_ID
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Ссылки",
+                    callback_data="mail_autojoin_links",
+                    style="primary",
+                    icon_custom_emoji_id=PLUS_EMOJI_ID,
+                ),
+                InlineKeyboardButton(
+                    text="Интервал",
+                    callback_data="mail_autojoin_interval",
+                    style="primary",
+                    icon_custom_emoji_id=TIME_EMOJI_ID,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=run_text,
+                    callback_data=run_cb,
+                    style=run_style,
+                    icon_custom_emoji_id=run_icon,
+                ),
+                InlineKeyboardButton(
+                    text="Очистить",
+                    callback_data="mail_autojoin_clear",
+                    style="danger",
+                    icon_custom_emoji_id=TRASH_EMOJI_ID,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Назад",
+                    callback_data="mail_settings",
+                    icon_custom_emoji_id=BACK_EMOJI_ID,
+                ),
             ],
         ]
     )
@@ -2239,6 +2322,23 @@ async def refresh_mail_settings_after_input(
     await message.answer(
         mailing_settings_message_caption(uid),
         reply_markup=settings_mail_inline(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def refresh_autojoin_after_input(
+    message: Message, panel_chat_id: int | None, panel_message_id: int | None
+) -> None:
+    bot = message.bot
+    uid = message.from_user.id
+    if panel_chat_id is not None and panel_message_id is not None:
+        try:
+            await bot.delete_message(panel_chat_id, panel_message_id)
+        except TelegramBadRequest:
+            pass
+    await message.answer(
+        mail_autojoin_caption(uid),
+        reply_markup=mail_autojoin_inline(uid),
         parse_mode=ParseMode.HTML,
     )
 
@@ -4301,6 +4401,36 @@ async def process_mailing_text_input(message: Message) -> bool:
     if not stage:
         return False
 
+    if stage == "mail_w_autojoin_links":
+        raw = message.text or message.caption or ""
+        await safe_delete_message(message)
+        links = mex.normalize_autojoin_links(raw)
+        if not links:
+            await message.answer(
+                "Ссылки не найдены. Поддерживается: <code>https://t.me/+hash</code>, "
+                "<code>https://t.me/joinchat/hash</code>, <code>https://t.me/name</code>, <code>@name</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return True
+        mex.set_autojoin_links(DB_PATH, uid, links)
+        mailing_input_state.pop(uid, None)
+        await refresh_autojoin_after_input(message, pch, pmid)
+        return True
+
+    if stage == "mail_w_autojoin_interval":
+        raw_txt = (message.text or "").strip()
+        await safe_delete_message(message)
+        try:
+            sec = int(raw_txt)
+        except ValueError:
+            await message.answer("Укажите целое число секунд, минимум 30")
+            return True
+        sec = max(30, sec)
+        mex.set_mailing_field(DB_PATH, uid, autojoin_interval_sec=sec)
+        mailing_input_state.pop(uid, None)
+        await refresh_autojoin_after_input(message, pch, pmid)
+        return True
+
     if stage == "mail_w_variant":
         slot = st.get("variant_slot") if isinstance(st, dict) else None
         if slot is None:
@@ -5531,6 +5661,109 @@ async def mail_settings_handler(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "mail_autojoin")
+async def mail_autojoin_handler(callback: CallbackQuery):
+    if is_banned(callback.from_user.id):
+        return
+    mailing_input_state.pop(callback.from_user.id, None)
+    await safe_edit_caption(
+        callback.message,
+        caption=mail_autojoin_caption(callback.from_user.id),
+        reply_markup=mail_autojoin_inline(callback.from_user.id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mail_autojoin_links")
+async def mail_autojoin_links_handler(callback: CallbackQuery):
+    if is_banned(callback.from_user.id):
+        return
+    _set_mailing_wait(callback, "mail_w_autojoin_links")
+    await safe_edit_caption(
+        callback.message,
+        caption=(
+            "<b><tg-emoji emoji-id='5771695636411847302'>📢</tg-emoji> Ссылки для автовступления</b>\n\n"
+            "<blockquote><b>Отправьте все ссылки одним сообщением.</b>\n"
+            "<b>Поддерживается: <code>https://t.me/+hash</code>, <code>https://t.me/joinchat/hash</code>, "
+            "<code>https://t.me/name</code>, <code>@name</code>.</b></blockquote>"
+        ),
+        reply_markup=mail_settings_cancel_inline(),
+    )
+    await callback.answer("Отправьте ссылки сообщением", show_alert=True)
+
+
+@dp.callback_query(F.data == "mail_autojoin_interval")
+async def mail_autojoin_interval_handler(callback: CallbackQuery):
+    if is_banned(callback.from_user.id):
+        return
+    _set_mailing_wait(callback, "mail_w_autojoin_interval")
+    await safe_edit_caption(
+        callback.message,
+        caption=(
+            "<b><tg-emoji emoji-id='5985616167740379273'>⏰</tg-emoji> Интервал автовступления</b>\n\n"
+            "<blockquote><b>Укажите паузу между кругами в секундах.</b>\n"
+            "<b>Минимум: <code>30</code> секунд.</b></blockquote>"
+        ),
+        reply_markup=mail_settings_cancel_inline(),
+    )
+    await callback.answer("Отправьте число секунд", show_alert=True)
+
+
+@dp.callback_query(F.data == "mail_autojoin_clear")
+async def mail_autojoin_clear_handler(callback: CallbackQuery):
+    if is_banned(callback.from_user.id):
+        return
+    mex.set_autojoin_links(DB_PATH, callback.from_user.id, [])
+    await safe_edit_caption(
+        callback.message,
+        caption=mail_autojoin_caption(callback.from_user.id),
+        reply_markup=mail_autojoin_inline(callback.from_user.id),
+    )
+    await callback.answer("Список очищен")
+
+
+@dp.callback_query(F.data == "mail_autojoin_start")
+async def mail_autojoin_start_handler(callback: CallbackQuery):
+    if is_banned(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    links = mex.get_autojoin_links(DB_PATH, uid)
+    ids = mex.get_selected_ids(DB_PATH, uid)
+    if not links:
+        await callback.answer("Сначала добавьте ссылки", show_alert=True)
+        return
+    if not ids:
+        await callback.answer("Сначала выберите аккаунты", show_alert=True)
+        return
+    mex.set_autojoin_running(DB_PATH, uid, True)
+    mex.mailing_log_append(uid, f"Автовступление запущено: аккаунтов {len(ids)}, ссылок {len(links)}.")
+    _start_autojoin_task(uid)
+    await safe_edit_caption(
+        callback.message,
+        caption=mail_autojoin_caption(uid),
+        reply_markup=mail_autojoin_inline(uid),
+    )
+    await callback.answer("Автовступление запущено", show_alert=True)
+
+
+@dp.callback_query(F.data == "mail_autojoin_stop")
+async def mail_autojoin_stop_handler(callback: CallbackQuery):
+    if is_banned(callback.from_user.id):
+        return
+    uid = callback.from_user.id
+    mex.set_autojoin_running(DB_PATH, uid, False)
+    mex.mailing_log_append(uid, "Автовступление остановлено вручную.")
+    t = autojoin_tasks.pop(uid, None)
+    if t and not t.done():
+        t.cancel()
+    await safe_edit_caption(
+        callback.message,
+        caption=mail_autojoin_caption(uid),
+        reply_markup=mail_autojoin_inline(uid),
+    )
+    await callback.answer("Автовступление остановлено", show_alert=True)
+
+
 @dp.callback_query(F.data == "mail_set_interval")
 async def mail_set_interval_handler(callback: CallbackQuery):
     if is_banned(callback.from_user.id):
@@ -6008,6 +6241,37 @@ def _acc_resolver(acc_id, owner_id):
     if row and row["user_id"] == owner_id:
         return row
     return None
+
+
+def _start_autojoin_task(user_id: int) -> None:
+    t = autojoin_tasks.get(user_id)
+    if t and not t.done():
+        return
+
+    async def log_to_user(msg: str) -> None:
+        mex.mailing_log_append(user_id, msg)
+
+    async def runner() -> None:
+        try:
+            await mex.run_autojoin_loop(
+                DB_PATH,
+                user_id,
+                TG_API_ID,
+                TG_API_HASH,
+                _acc_resolver,
+                log_fn=log_to_user,
+            )
+        except asyncio.CancelledError:
+            mex.mailing_log_append(user_id, "Задача автовступления отменена.")
+            raise
+        except Exception as e:
+            mex.set_autojoin_running(DB_PATH, user_id, False)
+            mex.mailing_log_append(user_id, f"Критическая ошибка автовступления: {e!r}")
+            logger.exception("autojoin loop uid=%s", user_id)
+        finally:
+            autojoin_tasks.pop(user_id, None)
+
+    autojoin_tasks[user_id] = asyncio.create_task(runner())
 
 
 def _start_mailing_task(user_id: int) -> None:
